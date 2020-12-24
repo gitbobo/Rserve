@@ -8,7 +8,38 @@ NOTE: Rserve 1.8 series has many new features, but it has also removed
       know what it means, just ignore this note.
 
 
-1.8-5	(under development)
+1.8-6	2020-06-11
+    o	proxy: handle WebSockets control frames (PING/PONG/CLOSE)
+	proper.
+
+    o	proxy: fail with an error if key/certificate cannot be
+	loaded at start time. Both -k and -c are required to
+	enable TLS/SSL. Also the proxy will issues an error if -k
+	is used and SSL support has not been available at compile
+	time. (#127)
+
+    o	proxy: linking no longer hard-codes `-lssl` (it effectively
+	failed compilation when SSL was not available).
+
+    o	proxy: added -S <host>[:<port>] which allows automatic
+	registration and de-registation with a server manager
+	when the service is available (e.g., this can be used
+	to keep the compute node list up-to-date automatically
+	when load-balancing via the nginx reverse proxy).
+
+    o	support large vectors in QAP encoding/decoding
+
+    o	restore some Windows compatibility - at least to the point
+	where it compiles. It is still strongly discouraged to use
+	Windows given how limited the OS is and how it prevents
+	any sensible use (Windows only supports single-client,
+	single-thread, cooperative mode - so for toy uses only).
+
+    o	content-type header entry is lower-cased only up to a
+	semicolon since trailing options may be case-sensitive. (#149)
+
+
+1.8-5	2017-03-25
     o	add support for callback in OCAP idle mode. If the function
 	.ocap.idle() exists in the global environment and the
 	configuration option
@@ -23,7 +54,7 @@ NOTE: Rserve 1.8 series has many new features, but it has also removed
 	worked reliably in the 1.8 series after the the rsio re-write.
 
 
-1.8-4
+1.8-4	2015-12-23
     o	bugfix: when using compute separation on some Linux systems the
 	death of the compute process may remain undetected. Rserve
 	now actively detects if the compute process has terminated and
@@ -37,7 +68,7 @@ NOTE: Rserve 1.8 series has many new features, but it has also removed
 	possibly conflicting) content-type headers.
 
 
-1.8-3
+1.8-3	2015-07-20
     o	add support for the notion of a context object which can be
 	retrieved/set using Rserve.context() function. If
 
@@ -65,12 +96,12 @@ NOTE: Rserve 1.8 series has many new features, but it has also removed
 	disabled via --disable-proxy configure directive.
 
 
-1.8-2
+1.8-2	2015-05-20
     o	fix bug in the WebSockets protocol implementation where frames
 	over 64kB from the client may be parsed incorrectly.
 
 
-1.8-1
+1.8-1	2015-04-08
     o	add ulog() R function to allow custom logging from R code
 
     o	add "fork here" directive which allows to spawn multiple
@@ -109,7 +140,7 @@ NOTE: Rserve 1.8 series has many new features, but it has also removed
 	also enabled.
 
 
-1.8-0
+1.8-0	2014-09-03
     o	new logging mechanism has been added to Rserve. It can
 	be enabled using the
 

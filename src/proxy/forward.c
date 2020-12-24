@@ -25,6 +25,9 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/un.h> /* needed for unix sockets */
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
 
 /* send OOB idle on WebSockets every 10 min (FIXME: make this configurable) */
 #define HEARTBEAT_INTERVAL 600
@@ -40,6 +43,9 @@ static char buf[1024];
 
 static char *doc_root = ".";
 static int   doc_root_len = 1;
+static char *sm_host = 0;
+static char *sm_port = 0;
+static char *default_sm_port = "40";
 
 static const char *infer_content_type(const char *fn) {
     const char *ext = fn ? strrchr(fn, '.') : 0;
@@ -566,6 +572,49 @@ static void ws_connected(args_t *arg, char *protocol) {
     ulog("INFO: WebSockets forwarding process done.");
 }
 
+/* send a message to the server maranger if configured */
+static void send_srvmgr(char *what) {
+    struct addrinfo hints;
+    struct addrinfo *result, *rp;
+    int sfd, s;
+
+    if (!sm_host || !sm_port) return; /* noop if no srvmgr is defined */
+
+    memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM; /* IPv4/6 but TCP */
+    hints.ai_flags = 0;
+    hints.ai_protocol = 0;
+
+    if ((s = getaddrinfo(sm_host, sm_port, &hints, &result))) {
+	ulog("ERROR: cannot resolve srvmgr host (%s): %s", sm_host, gai_strerror(s));
+	return;
+    }
+
+    for (rp = result; rp != NULL; rp = rp->ai_next) {
+	struct timeval timeout;
+	sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+	if (sfd == -1)
+	    continue;
+	/* reduce the timeout substantially to 200ms */
+	timeout.tv_sec  = 0;
+	timeout.tv_usec = 200000;
+	setsockopt(sfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+	if (connect(sfd, rp->ai_addr, rp->ai_addrlen) != -1)
+	    break;
+	close(sfd);
+    }
+
+    if (!rp) {
+	ulog("ERROR: cannot connect to srvmgr host (%s:%s): %s", sm_host, sm_port, strerror(errno));
+	return;
+    }
+    send(sfd, what, strlen(what), 0);
+    ulog("INFO: send '%s' to srvmgr %s:%s", what, sm_host, sm_port);
+    close(sfd);
+}
+
 /* queuing notes:
 
    so far we are using a simple FIFO, but we need something smarter
@@ -594,10 +643,15 @@ static void ws_connected(args_t *arg, char *protocol) {
 int R_script_handler(http_request_t *req, http_result_t *res, const char *path);
 void R_script_socket(const char *s);
 
-static int die(const char *str) { fprintf(stderr,"\nError: %s\n\n", str); return 1; }
+static int die(const char *str) { fprintf(stderr,"\nERROR: %s\n\n", str); return 1; }
+
+#define TLS_INFO_KEY  1
+#define TLS_INFO_CERT 2
+#define TLS_INFO_CA   4
 
 int main(int ac, char **av) {
-    int http_port = 8088, ws_port = -1, i = 0, flags = 0;
+    int http_port = 8088, ws_port = -1, i = 0, flags = 0, tls_info = 0;
+    int active_servers = 0;
     const char *ulog_path = "ulog_socket";
     const char *scr_path = "Rscript_socket";
 
@@ -619,42 +673,80 @@ int main(int ac, char **av) {
 		    tls_t *tls = shared_tls(0);
 		    if (!tls)
 			tls = shared_tls(new_tls());
-		    set_tls_pk(tls, av[i]);
+		    if (!tls)
+			return die("unable to initialize SSL - you may be missing SSL support.");
+		    if (!set_tls_pk(tls, av[i]))
+			return perror_tls("ERROR: Unable to load SSL key from '%s': ", av[i]);
 		    flags |= SRV_TLS;
+		    tls_info |= TLS_INFO_KEY;
 		} else return die("missing key path in -k <key-path>");
 		break;
 	    case 'C': if (++i < ac) {
 		    tls_t *tls = shared_tls(0);
 		    if (!tls)
 			tls = shared_tls(new_tls());
-		    set_tls_ca(tls, av[i], 0);
+		    if (!set_tls_ca(tls, av[i], 0))
+			return perror_tls("ERROR: Unable to load CA chain from '%s': ", av[i]);
+		    tls_info |= TLS_INFO_CA;
 		} else return die("missing CA-path path in -C <CA-path>");
+		break;
+	    case 'S': if (++i < ac) {
+		    char *c = strchr(av[i], ':');
+		    sm_port = c ? (c + 1) : default_sm_port;
+		    if (c) *c = 0;
+		    sm_host = av[i];
+		} else return die("missing host in -S <host>[:<port>]");
 		break;
 	    case 'c': if (++i < ac) {
 		    tls_t *tls = shared_tls(0);
 		    if (!tls)
 			tls = shared_tls(new_tls());
-		    set_tls_cert(tls, av[i]);
+		    if (!set_tls_cert(tls, av[i]))
+			return perror_tls("ERROR: Unable to load SSL certificate from '%s': ", av[i]);
+		    tls_info |= TLS_INFO_CERT;
 		} else return die("missing cert-path path in -C <cert-path>");
 		break;
             case 'h': printf("\n\
  Usage: %s [-h] [-p <http-port>] [-w <ws-port>] [-s <QAP-socket>] [-R <Rscript-socket>] [-r <doc-root>]\n\
-        [-k <TLS-key-path> [-c <TLS-cert-path>] [-C <TLS-CA-path>]]\n\
-\n", av[0]);
+        [-k <TLS-key-path> [-c <TLS-cert-path>] [-C <TLS-CA-path>]] [-u <ulog-socket>] [-S <host>[:<port>]]]\n\n", av[0]);
                 return 0;
             default:
                 fprintf(stderr, "\nUnrecognized flag -%c\n", av[i][1]);
                 return 1;
             }
-    
+
+    if (tls_info & TLS_INFO_KEY) {
+	if ((tls_info & (TLS_INFO_KEY | TLS_INFO_CERT)) != (TLS_INFO_KEY | TLS_INFO_CERT))
+	    return die("-k <key> requires a corresponding certificate to be supplied with -c <cert>, but it is missing");
+    } else if (tls_info)
+	fprintf(stderr, "WARNING: -c or -C are supplied without -k, they are ignored since SSL is only enabled if -k is present.\n");
+
     doc_root_len = strlen(doc_root);
     ulog_set_path(ulog_path);
     ulog("----------------");
     R_script_socket(scr_path);
     add_content_handler(R_script_handler);
-    if (http_port > 0) create_HTTP_server(http_port, HTTP_WS_UPGRADE | flags, http_request, ws_connected);
-    if (ws_port > 0) create_WS_server(ws_port, WS_PROT_QAP | flags, ws_connected);
+    if (http_port > 0) {
+	server_t *srv = create_HTTP_server(http_port, HTTP_WS_UPGRADE | flags, http_request, ws_connected);
+	if (srv) {
+	    ulog("WS/QAP INFO: started HTTP server on port %d", http_port);
+	    active_servers++;
+	} else
+	    ulog("WS/QAP ERROR: failed to start HTTP server on port %d", http_port);
+    }
+    if (ws_port > 0) {
+	server_t *srv = create_WS_server(ws_port, WS_PROT_QAP | flags, ws_connected);
+	if (srv) {
+	    ulog("WS/QAP INFO: started WebSocket server on port %d", ws_port);
+	    active_servers++;
+	} else
+	    ulog("WS/QAP ERROR: failed to start WebSocket server on port %d", ws_port);
+    }
+    if (!active_servers)
+	return die("there are no active servers, aborting.");
     ulog("WS/QAP INFO: starting server loop (http=%d, ws=%d, qap='%s', rscript='%s', doc_root='%s'", http_port, ws_port, proxy->qap_socket_path, scr_path, doc_root);
+    send_srvmgr("ADD");
     serverLoop();
+    send_srvmgr("DEL");
     return 0;
 }

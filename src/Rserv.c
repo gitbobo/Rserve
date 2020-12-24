@@ -166,6 +166,7 @@ typedef int socklen_t;
 #define srandom() srand()
 #define CAN_TCP_NODELAY
 #define _WINSOCKAPI_
+#include <winsock2.h>
 #include <windows.h>
 #include <winbase.h>
 #include <io.h>
@@ -192,13 +193,15 @@ typedef int socklen_t;
 #  include <time.h>
 # endif
 #endif
-#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/signal.h>
 #include <unistd.h>
 #include <sys/un.h> /* needed for unix sockets */
+#else
+#include <time.h>
 #endif
+#include <sys/stat.h>
 #ifdef FORKED
 #include <sys/wait.h>
 #include <signal.h>
@@ -279,6 +282,10 @@ typedef union { char c[16]; int i[4]; } rsmsg_addr_t;
 #define RSMSG_ADDR_LEN (sizeof(rsmsg_addr_t))
 
 #define MAX_CTRL_DATA (1024*1024) /* max. length of data for control commands - larger data will be ignored */
+
+#ifdef WIN32
+#define pid_t int
+#endif
 
 #include "RSserver.h"
 #include "websockets.h"
@@ -378,6 +385,7 @@ void stop_server_loop() {
 #include <unistd.h>
 #include <grp.h>
 #include <pwd.h>
+#endif
 
 static char tmpdir_buf[1024];
 
@@ -385,6 +393,10 @@ static char tmpdir_buf[1024];
 
 #ifdef unix
 char wdname[512];
+
+#define mkdir_(A,B) mkdir(A,B)
+#else
+#define mkdir_(A,B) mkdir(A) /* no chmod on Windows */
 #endif
 
 #if !defined(S_IFDIR) && defined(__S_IFDIR)
@@ -443,13 +455,15 @@ static void prepare_set_user(int uid, int gid) {
 		}
 	}
 	snprintf(tmpdir_buf, sizeof(tmpdir_buf), "%s.%d.%d", tmp, uid, gid);
-	if (mkdir(tmpdir_buf, 0700)) {} /* it is ok to fail if it exists already */
+	if (mkdir_(tmpdir_buf, 0700)) {} /* it is ok to fail if it exists already */
 	/* gid can be 0 to denote no gid change -- but we will be using
 	   0700 anyway so the actual gid is not really relevant */
+#ifdef unix
 	if (chown(tmpdir_buf, uid, gid)) {}
-	R_TempDir = strdup(tmpdir_buf);
 	if (workdir && /* FIXME: gid=0 will be bad here ! */
 		chown(wdname, uid, gid)) {}
+#endif
+	R_TempDir = strdup(tmpdir_buf);
 }
 
 /* send/recv wrappers that are more robust */
@@ -564,6 +578,7 @@ int cio_recv(int s, void *buffer, int length, int flags) {
 	return -1;
 }
 
+#ifdef unix
 static int set_user(const char *usr) {
     struct passwd *p = getpwnam(usr);
 	if (!p) return 0;
@@ -636,12 +651,21 @@ static char rserve_rev[16]; /* this is generated from rserve_ver_id by main */
 #include <openssl/rand.h>
 
 static void generate_random_bytes(void *buf, int len) {
+#ifdef RAND_FALLBACK
 	if (RAND_bytes(buf, len) != 1 &&
 		RAND_pseudo_bytes(buf, len) == -1) {
 		int i;
 		for (i = 0; i < len; i++)
 			((char*)buf)[i] = (char) random();
 	}
+#else
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    if (RAND_bytes(buf, len) != 1 && RAND_pseudo_bytes(buf, len) < 0)
+#else /* OpenSSL 1.1+ doesn't support pseudo random, so fail hard */
+    if (RAND_bytes(buf, len) != 1)
+#endif
+		Rf_error("Cannot generate random bytes");
+#endif
 }
 
 #else
@@ -1032,6 +1056,7 @@ static int performConfig(int when) {
 /* called once the server process is setup (e.g. after
    daemon fork for forked servers) */
 static void RSsrv_init() {
+#ifdef unix
 	if (pidfile) {
 		FILE *f = fopen(pidfile, "w");
 		if (f) {
@@ -1039,6 +1064,7 @@ static void RSsrv_init() {
 			fclose(f);
 		} else RSEprintf("WARNING: cannot write into pid file '%s'\n", pidfile);
 	}
+#endif
 }
 
 static void RSsrv_done() {
@@ -2439,9 +2465,7 @@ static int auth_user(const char *usr, const char *pwd, const char *salt) {
 #ifdef HAVE_RSA
 #include <openssl/rsa.h>
 #include <openssl/rand.h>
-#ifdef RSERV_DEBUG
 #include <openssl/err.h>
-#endif
 
 static RSA *rsa_srv_key;
 
@@ -2476,6 +2500,38 @@ static int rsa_load_key(const char *buf) {
 	return 0;
 }
 
+/* OpenSSL 1.1 has deprecated RSA_generate_key() without
+   providing an alternative, so we a have to re-implement it
+   ourselves (for no good reason) ... */
+static RSA *RSA_generate_key0(int bits, unsigned long expon) {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    return RSA_generate_key(bits, expon, 0, 0);
+#else  /* How to make simple things really complicated ... */
+    RSA *rsa = RSA_new();
+    if (!rsa) {
+		Rf_warning("cannot allocate RSA key: %s", ERR_error_string(ERR_get_error(), NULL));
+		return 0;
+	}
+    {
+        BIGNUM *e = BN_new();
+		if (!e) {
+            RSA_free(rsa);
+			Rf_warning("cannot allocate exponent: %s", ERR_error_string(ERR_get_error(), NULL));
+			return 0;
+        }
+		BN_set_word(e, expon);
+		if (RSA_generate_key_ex(rsa, bits, e, NULL) <= 0) {
+            BN_free(e);
+			RSA_free(rsa);
+			Rf_warning("cannot generate key: %s", ERR_error_string(ERR_get_error(), NULL));
+			return 0;
+        }
+		BN_free(e);
+    }
+	return rsa;
+#endif
+}
+
 static int rsa_gen_resp(char **dst) {
 	unsigned char *kb;
 	unsigned char *pt;
@@ -2484,12 +2540,12 @@ static int rsa_gen_resp(char **dst) {
 #ifdef RSERV_DEBUG
 		printf("rsa_gen_resp: generating RSA key\n");
 #endif
-		rsa_srv_key = RSA_generate_key(4096, 65537, 0, 0);
+		rsa_srv_key = RSA_generate_key0(4096, 65537);
 #ifdef RSERV_DEBUG
 		printf(" - done\n");
 #endif
 	}
-	if (!rsa_srv_key || RAND_bytes((unsigned char*) authkey, sizeof(authkey)) == 0)
+	if (!rsa_srv_key || RAND_bytes((unsigned char*) authkey, sizeof(authkey)) != 1)
 		return 0;
 	kb = calloc(65536, 1);
 	if (!kb)
@@ -3021,12 +3077,17 @@ int server_send(args_t *arg, const void *buf, rlen_t len) {
 }
 
 SEXP Rserve_kill_compute(SEXP sSig) {
+#ifdef unix
 	int sig = asInteger(sSig);
 	if (!compute_pid)
 		Rf_error("no compute process attached");
 	return ScalarLogical(kill(compute_pid, sig) == 0);
+#else
+	Rf_error("Windows does not support separate compute process.");
+#endif
 }
 
+#ifdef unix
 SEXP Rserve_fork_compute(SEXP sExp) {
 	int fd[2];
 	pid_t fpid;
@@ -3149,6 +3210,12 @@ SEXP Rserve_fork_compute(SEXP sExp) {
 	/* unreachable */
 	return R_NilValue;
 }
+#else
+SEXP Rserve_fork_compute(SEXP sExp) {
+	Rf_error("Windows does not support separate compute process.");
+}
+#endif
+
 
 /* 1 = iteration successful - OCAP called
    2 = iteration successful - OOB pending (only signalled if oob_hdr is non-null)
